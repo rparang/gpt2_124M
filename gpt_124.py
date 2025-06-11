@@ -12,7 +12,7 @@ class CausalSelfAttention(nn.Module):
 		assert config.n_embd % config.n_head == 0
 
 		self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # key, query, value projections for all heads but in a batch. Saves you from three separate instantiations of nn.Linear
-		self.proj = nn.Linear(config.n_embd, config.n_embd) # output projection
+		self.c_proj = nn.Linear(config.n_embd, config.n_embd) # output projection
 
 		self.n_head = config.n_head
 		self.n_embd = config.n_embd
@@ -67,7 +67,7 @@ class Block(nn.Module):
 		super().__init__()
 		self.ln_1 = nn.LayerNorm(config.n_embd)
 		self.attn = CausalSelfAttention(config)
-		self.ln_1 = nn.LayerNorm(config.n_embd)
+		self.ln_2 = nn.LayerNorm(config.n_embd)
 		self.mlp = MLP(config)		
 
 	def forward(self, x):
@@ -98,6 +98,25 @@ class GPT(nn.Module):
 			ln_f = nn.LayerNorm(config.n_embd)
 		))
 		self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+
+	def forward(self, idx):
+		# idx is shape (B, T)
+		B, T = idx.size()
+		assert T <= self.config.block_size, f"Cannot forward sequence of length {T}. Block size is only {self.config.block_size}"
+		# forward the token and position embeddings
+		pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+		pos_emb = self.transformer.wpe(pos) # shape (T, n_embd)
+		tok_emb = self.transformer.wte(idx) # shape (B, T, n_embd)
+		x = tok_emb + pos_emb
+		# forward through the blocks of the transformer
+		for block in self.transformer.h:
+			x = block(x)
+		# forward the final layernorm and the classifier
+		x = self.transformer.ln_f(x)
+		logits = self.lm_head(x) # (B, T, vocab_size)
+		return logits
+
 
 	@classmethod
 	def from_pretrained(cls, model_type):
@@ -147,6 +166,25 @@ class GPT(nn.Module):
 					sd[k].copy_(sd_hf[k])
 
 		return model
+
+# ----------------------------------------------------------
+
+num_return_sequences = 5
+max_length = 30
+
+model = GPT.from_pretrained('gpt2')
+model.eval()
+# model.to('cuda')
+
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+tokens = tokens.unsqueeze(0).repeat(5, 1) # (5, 8)
+x = tokens.to('cuda')
+
+
+
 
 
 
