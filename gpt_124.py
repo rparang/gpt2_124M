@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -42,7 +43,7 @@ class CausalSelfAttention(nn.Module):
 		y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
 		# output project
-		y = self.proj(y)
+		y = self.c_proj(y)
 		return y
 
 
@@ -181,11 +182,27 @@ enc = tiktoken.get_encoding('gpt2')
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
 tokens = tokens.unsqueeze(0).repeat(5, 1) # (5, 8)
-x = tokens.to('cuda')
+# x = tokens.to('cuda')
+x = tokens
 
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    with torch.no_grad():
+        logits = model(x) # (B, T, vocab_size)
+        logits = logits[:, -1, :] # (B, vocab_size), take logits at last position
+        probs = F.softmax(logits, dim=-1) # get probabilities
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # do top-k sampling of 50 (huggingface pipeline default), topk_probs and topk_indices become (5, 50)
+        ix = torch.multinomial(topk_probs, 1) # (B, 1), select a token from top-k probabilities
+        xcol = torch.gather(topk_indices, -1, ix) # (B, 1), gather corresponding indices
+        x = torch.cat((x, xcol), dim=1) # append to the sequence
+        # print(x)
 
-
-
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    # print(tokens)
+    decoded = enc.decode(tokens)
+    print(">", decoded)
 
 
 
