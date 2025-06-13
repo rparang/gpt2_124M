@@ -8,33 +8,33 @@ from torch.nn import functional as F
 # ----------------------------------------------------------
 
 class DataLoaderLite:
-    def __init__(self, B, T):
-        self.B = B
-        self.T = T
+	def __init__(self, B, T):
+		self.B = B
+		self.T = T
 
-        # at init load tokens from disk and store them in memory
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+		# at init load tokens from disk and store them in memory
+		with open('input.txt', 'r') as f:
+			text = f.read()
+		enc = tiktoken.get_encoding('gpt2')
+		tokens = enc.encode(text)
+		self.tokens = torch.tensor(tokens)
+		print(f"loaded {len(self.tokens)} tokens")
+		print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
-        # state
-        self.current_position = 0
+		# state
+		self.current_position = 0
 
-    def next_batch(self):
-        B, T = self.B, self.T
-        buf = self.tokens[self.current_position:self.current_position + B * T + 1]
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
+	def next_batch(self):
+		B, T = self.B, self.T
+		buf = self.tokens[self.current_position:self.current_position + B * T + 1]
+		x = (buf[:-1]).view(B, T) # inputs
+		y = (buf[1:]).view(B, T) # targets
 
-        self.current_position += B * T
+		self.current_position += B * T
 
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
-        return x, y
+		if self.current_position + (B * T + 1) > len(self.tokens):
+			self.current_position = 0
+		return x, y
 
 class CausalSelfAttention(nn.Module):
 
@@ -44,6 +44,7 @@ class CausalSelfAttention(nn.Module):
 
 		self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # key, query, value projections for all heads but in a batch. Saves you from three separate instantiations of nn.Linear
 		self.c_proj = nn.Linear(config.n_embd, config.n_embd) # output projection
+		self.c_proj.NANOGPT_SCALE_INIT = 1 # set flag so we know on initialization we need to scale down the std for these residual streams
 
 		self.n_head = config.n_head
 		self.n_embd = config.n_embd
@@ -84,6 +85,7 @@ class MLP(nn.Module):
 		self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd) # On naming (eg 'c_fc'), we are replicating the GPT2 model
 		self.gelu = nn.GELU(approximate='tanh')
 		self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+		self.c_proj.NANOGPT_SCALE_INIT = 1 # set flag so we know on initialization we need to scale down the std for these residual streams
 
 	def forward(self, x):
 		x = self.c_fc(x)
@@ -116,18 +118,6 @@ class GPTConfig:
 	n_head: int = 12 # number of heads
 	n_embd: int = 768 # embedding dimension
 
-	# block_size: int = 32 # max sequence length
-	# vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-	# n_layer: int = 3 # number of layers
-	# n_head: int = 4 # number of heads
-	# n_embd: int = 128 # embedding dimension
-
-	# block_size: int = 256 # max sequence length
-	# vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-	# n_layer: int = 6 # number of layers
-	# n_head: int = 6 # number of heads
-	# n_embd: int = 384 # embedding dimension
-
 class GPT(nn.Module):
 	
 	def __init__(self, config):
@@ -144,6 +134,19 @@ class GPT(nn.Module):
 
 		# weight sharing scheme
 		self.transformer.wte.weight = self.lm_head.weight
+
+		self.apply(self._init_weights)
+
+	def _init_weights(self, module):
+		if isinstance(module, nn.Linear):
+			std = 0.02
+			if hasattr(module, 'NANOGPT_SCALE_INIT'):
+				std = (2 * self.config.n_layer) ** -0.5 # Scale down the residual streams so std doesn't bloat as the streams add. Note we multiply by 2 bc it happens twice in each Block (one residual in attention, one in MLP)
+			torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+			if module.bias is not None:
+				torch.nn.init.zeros_(module.bias)
+		elif isinstance(module, nn.Embedding):
+			torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 
 	def forward(self, idx, targets=None):
@@ -224,10 +227,14 @@ class GPT(nn.Module):
 # attept to autodetect the device
 device = "cpu"
 if torch.cuda.is_available():
-    device = "cuda"
+	device = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
+	device = "mps"
 print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+	torch.cuda.manual_seed(1337)
 
 
 train_loader = DataLoaderLite(B=4, T=32)
