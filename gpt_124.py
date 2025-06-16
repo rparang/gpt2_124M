@@ -245,7 +245,7 @@ torch.set_float32_matmul_precision('high')
 # get logits
 model = GPT(GPTConfig())
 model.to(device)
-# logits, loss = model(x, y)
+mode = torch.compile(model)
 
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -256,7 +256,7 @@ for i in range(50):
 	optimizer.zero_grad()
 	with torch.autocast(device_type=device, dtype=torch.bfloat16):
 		logits, loss = model(x, y)
-		import code; code.interact(local=locals())
+		# import code; code.interact(local=locals())
 	loss.backward()
 	optimizer.step()
 	t1 = time.time()
