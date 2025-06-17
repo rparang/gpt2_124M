@@ -248,6 +248,9 @@ model = GPT(GPTConfig())
 model.to(device)
 # model = torch.compile(model)
 
+# Number of parameters
+print(sum([p.nelement() for p in model.parameters()]))
+
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
