@@ -11,9 +11,11 @@ from torch.nn import functional as F
 # ----------------------------------------------------------
 
 class DataLoaderLite:
-	def __init__(self, B, T):
+	def __init__(self, B, T, process_rank, num_processes):
 		self.B = B
 		self.T = T
+		self.process_rank = process_rank
+		self.num_processes = num_processes
 
 		# at init load tokens from disk and store them in memory
 		with open('input.txt', 'r') as f:
@@ -22,10 +24,9 @@ class DataLoaderLite:
 		tokens = enc.encode(text)
 		self.tokens = torch.tensor(tokens)
 		print(f"loaded {len(self.tokens)} tokens")
-		print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
 		# state
-		self.current_position = 0
+		self.current_position = self.B * self.T * self.process_rank
 
 	def next_batch(self):
 		B, T = self.B, self.T
@@ -33,10 +34,10 @@ class DataLoaderLite:
 		x = (buf[:-1]).view(B, T) # inputs
 		y = (buf[1:]).view(B, T) # targets
 
-		self.current_position += B * T
+		self.current_position += B * T * self.num_processes
 
-		if self.current_position + (B * T + 1) > len(self.tokens):
-			self.current_position = 0
+		if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+			self.current_position = self.B * self.T * self.process_rank
 		return x, y
 
 class CausalSelfAttention(nn.Module):
@@ -294,16 +295,17 @@ if torch.cuda.is_available():
 	torch.cuda.manual_seed(1337)
 
 
-total_batch_size = 131072 #524288 # 2^19, ~0.5M, in number of tokens
-B = 8 #16 # micro batch size
-T = 64 #1024 # sequence length
+total_batch_size = 65536 #131072 #524288 # 2^19, ~0.5M, in number of tokens
+B = 4 #16 # micro batch size
+T = 32 #1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
 	print(f"total desired batch size: {total_batch_size}")
 	print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T)
+
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 
 torch.set_float32_matmul_precision('high')
 
