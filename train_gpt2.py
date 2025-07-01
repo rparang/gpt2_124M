@@ -8,37 +8,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# ----------------------------------------------------------
-
-class DataLoaderLite:
-	def __init__(self, B, T, process_rank, num_processes):
-		self.B = B
-		self.T = T
-		self.process_rank = process_rank
-		self.num_processes = num_processes
-
-		# at init load tokens from disk and store them in memory
-		with open('input.txt', 'r') as f:
-			text = f.read()
-		enc = tiktoken.get_encoding('gpt2')
-		tokens = enc.encode(text)
-		self.tokens = torch.tensor(tokens)
-		print(f"loaded {len(self.tokens)} tokens")
-
-		# state
-		self.current_position = self.B * self.T * self.process_rank
-
-	def next_batch(self):
-		B, T = self.B, self.T
-		buf = self.tokens[self.current_position:self.current_position + B * T + 1]
-		x = (buf[:-1]).view(B, T) # inputs
-		y = (buf[1:]).view(B, T) # targets
-
-		self.current_position += B * T * self.num_processes
-
-		if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-			self.current_position = self.B * self.T * self.process_rank
-		return x, y
+# ---------------------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
 
@@ -252,6 +222,57 @@ class GPT(nn.Module):
 		return model
 
 # ---------------------------------------------------------------------------------------
+
+def load_tokens(filename):
+	npt = np.load(filename)
+	npt = npt.astype(np.int32)
+	ptt = torch.tensor(npt, dtype=torch.long)
+	return ptt
+
+
+class DataLoaderLite:
+	def __init__(self, B, T, process_rank, num_processes, split):
+		self.B = B
+		self.T = T
+		self.process_rank = process_rank
+		self.num_processes = num_processes
+		assert split in {'train', 'val'}
+
+
+		# get the shard filename
+		data_root = "edu_fineweb10B"
+		shards = os.listdir(data_root)
+		shards = [s for s in shards if split in s]
+		shards = sorted(shards)
+		shards = [os.path.join(data_root, s) for s in shards]
+		self.shards = shards
+		asset len(shards) > 0, f"no shards found for split {split}"
+		if master_process:
+			print(f"found {len(shards)} shards for split {split}")
+		self.reset()
+
+	def reset(self):
+		# state, init at shard zero
+		self.current_shard = 0
+		self.tokens = load_tokens(self.shards[self.current_shard])
+		self.current_position = self.B * self.T * self.process_rank
+
+	def next_batch(self):
+		B, T = self.B, self.T
+		buf = self.tokens[self.current_position:self.current_position + B * T + 1]
+		x = (buf[:-1]).view(B, T) # inputs
+		y = (buf[1:]).view(B, T) # targets
+
+		self.current_position += B * T * self.num_processes
+
+		if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+			self.current_shard = (self.current_shard + 1) % len(self.shards)
+			self.tokens = load_tokens(self.shards[self.current_shard])
+			self.current_position = B * T * self.process_rank
+		return x, y
+
+
+# ---------------------------------------------------------------------------------------
 # simple launch
 # python train_gpt2.python
 # DDP launch for e.g. 9 GPUs:
@@ -307,7 +328,8 @@ if master_process:
 	print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 torch.set_float32_matmul_precision('high')
 
