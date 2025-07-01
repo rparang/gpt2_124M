@@ -75,7 +75,7 @@ with mp.Pool(nprocs) as pool:
 			all_tokens_np[0:len(tokens) - remainder] = tokens[remainder:]
 			token_count = len(tokens) - remainder
 
-		if token_count != 0:
-			split = "val" if shard_index == 0 else "train"
-			filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
-			write_datafile(filename, all_tokens_np[:token_count])
+	if token_count != 0:
+		split = "val" if shard_index == 0 else "train"
+		filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
+		write_datafile(filename, all_tokens_np[:token_count])
