@@ -163,12 +163,14 @@ class GPT(nn.Module):
 		]
 		num_decay_params = sum(p.numel() for p in decay_params)
 		num_nodecay_params = sum(p.numel() for p in nodecay_params)
-		print(f"Number of decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-		print(f"Number of non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+		if master_process:
+			print(f"Number of decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+			print(f"Number of non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
 		# Create the AdamW optimizer and use the fused version if it is available
 		fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
 		use_fused = fused_available and 'cuda' in device
-		print(f"using fused AdamW: {use_fused}")
+		if master_process:
+			print(f"using fused AdamW: {use_fused}")
 		optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
 		return optimizer
 
@@ -318,10 +320,11 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
 	torch.cuda.manual_seed(1337)
 
+enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 65536 #131072 #524288 # 2^19, ~0.5M, in number of tokens
-B = 4 #16 # micro batch size
-T = 32 #1024 # sequence length
+total_batch_size = 524288 # 2^19, ~0.5M, in number of tokens
+B = 64 # micro batch size
+T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
@@ -337,15 +340,16 @@ torch.set_float32_matmul_precision('high')
 # create model
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
-# model = torch.compile(model)
+model = torch.compile(model)
 if ddp:
 	model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715 # GPT3 warms up linearly to 375M tokens. 375e6 / 524288 is 715 steps
+max_steps = 19073 #10B tokens and each step does 524288
 def get_lr(it):
 	# 1) linear warmup for warmup_iters steps
 	if it < warmup_steps:
@@ -364,12 +368,65 @@ def get_lr(it):
 print(f"Number of parameters: {sum(p.nelement() for p in model.parameters()):,}")
 
 # optimize!
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 
 
 for step in range(max_steps):
 	t0 = time.time()
+
+	# once in a while evaluate our validatoin loss
+	if step % 100 == 0:
+		model.eval()
+		val_loader.reset()
+		with torch.no_grad():
+			val_loss_accum = 0.0
+			val_loss_steps = 20
+			for _ in range(val_loss_steps):
+				x, y = val_loader.next_batch()
+				x, y = x.to(device), y.to(device)
+				with torch.autocast(device_type=device, dtype=torch.bfloat16):
+					logits, loss = model(x, y)
+				loss = loss / val_loss_steps
+				val_loss_accum += loss.detach()
+		if ddp:
+			dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+		if master_process:
+			print(f"validation loss: {val_loss_accum.item():.4f}")
+
+
+	# once in a while generate from the model (except step 0 which is noise)
+	# torch.compile throws an error if you don't disable
+	if step > 0 and step % 100 ==0:
+		model.eval()
+		num_return_sequences = 4
+		max_length = 32
+		tokens = enc.encode("Hello, I'm a language model,")
+		tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+		tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (4, 8)
+		xgen = tokens.to(device)
+		sample_rng = torch.Generator(device=device)
+		sample_rng.manual_seed(42 + ddp_rank)
+		while xgen.size(1) < max_length:
+		    with torch.no_grad():
+		        logits = model(xgen) # (B, T, vocab_size)
+		        logits = logits[:, -1, :] # (B, vocab_size), take logits at last position
+		        probs = F.softmax(logits, dim=-1) # get probabilities
+		        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # do top-k sampling of 50 (huggingface pipeline default), topk_probs and topk_indices become (5, 50)
+		        ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1), select a token from top-k probabilities
+		        xcol = torch.gather(topk_indices, -1, ix) # (B, 1), gather corresponding indices
+		        xgen = torch.cat((xgen, xcol), dim=1) # append to the sequence
+		        # print(x)
+
+		for i in range(num_return_sequences):
+		    tokens = x[i, :max_length].tolist()
+		    decoded = enc.decode(tokens)
+		    print(">", decoded)
+		    print(f"rank {ddp_rank} sample {i}: {decoded}")
+
+
+	# training loop
+	model.train()
 	optimizer.zero_grad()
 	loss_accum = 0.0
 	for micro_step in range(grad_accum_steps):
@@ -378,6 +435,10 @@ for step in range(max_steps):
 		with torch.autocast(device_type=device, dtype=torch.bfloat16):
 			logits, loss = model(x, y)
 			# import code; code.interact(local=locals())
+		# we have to scale the loss to account for gradient accumulaton
+		# because the gradients just add on each successive backward(),
+		# addition of gradients correspond to a SUM in the objective, but
+		# instead of a SUM we want MEAN. Scale the loss here to it comes out right
 		loss = loss / grad_accum_steps
 		loss_accum += loss.detach()
 		if ddp:
@@ -397,7 +458,7 @@ for step in range(max_steps):
 	tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
 	tokens_per_sec = tokens_processed / dt
 	if master_process:
-		print(f"step: {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec}")
+		print(f"step: {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec}")
 
 
 if ddp:
