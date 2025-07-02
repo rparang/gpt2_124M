@@ -1,5 +1,6 @@
 import os
 import tiktoken
+import numpy as np
 import math
 import time
 import inspect
